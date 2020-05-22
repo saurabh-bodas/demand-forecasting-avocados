@@ -1,0 +1,577 @@
+---
+title: "Demand Forecasting: Predicting the Demand for Avocados"
+output:
+  pdf_document: default
+  word_document: default
+---
+
+Demand forecasting is a crucial area for retail businesses. Inventory management, assortment selection, and pricing are all deeply affected by the quality of demand forecasts. 
+
+In this project, I have attempted to forecast the demand for avocados over the next quarter. In this case, avocados are not a new product and thus, we have access to historical data. I have used this dataset from Kaggle to perform my analyses: 
+
+https://www.kaggle.com/neuromusic/avocado-prices
+
+
+After preliminary data exploration to explore the relationship between the demand and other crucial factors like pricing strategy, product type, and geographic region of sale, I attempted the following models to predict the demand: 
+
+1. **Simple linear regression**
+2. **Time series regression** (which allows for fourier terms to capture seasonality)
+3. **ARIMA forecasting without regressors** along with the **naive forecast**, which will serve as *benchmark metrics*
+4. **ARIMA forecasting with regressors**
+5. **Seemingly Unrelated Regression** (SUR) to capture the correlation of errors across region-specific linear models
+6. An **ensemble** of SUR and ARIMA models, which is a simple average over the two
+
+As we will learn later, the ensemble model performs the best on an aggregate level.
+
+A few points to consider before moving forward with the analysis: 
+
+1. We don't observe the true demand for avocados, but only the sales that were made
+2. Because we have access to weekly data, we can make meaningful predictions at the weekly level. But forecasts at the daily level would be even better (we would model in the day-by-day seasonality in this case).
+
+# Loading packages and data
+
+```{r results='hide', warning = FALSE, message=FALSE}
+#loading packages
+library(readxl)
+library(plyr)
+library(dplyr)
+library(ggplot2)
+library(lubridate)
+library(forecast)
+library(tidyr)
+library(excelR)
+library(readxl)
+library(writexl)
+library(caret)
+library(systemfit)
+library(stringr)
+library(viridis)
+library(MASS)
+library(rcompanion)
+```
+
+
+```{r }
+#loading data
+avocado = read_excel('avocado.xlsx', sheet='Sheet1')
+
+#adding the trend and month seasonality variables
+avocado$trend = as.numeric((avocado$date) - 1420329600)/604800
+avocado$month = format(as.Date(avocado$date), "%m")
+avocado$month = as.factor(avocado$month)
+
+#filtering out aggregate-region rows
+avo_clean = avocado%>%filter(!region %in% c('Southeast','Midsouth', 
+                                            'West', 'SouthCentral','NorthEast','WestTexNewMexico', 
+                                            "TotalUS"))
+```
+
+# 1. Exploratory Data Analysis
+
+A quick snapshot of the data:
+
+```{r}
+head(avocado)
+```
+
+Let's plot the demand histogram to explore what transformations can be applied. 
+
+```{r warning=FALSE, fig.width=6,fig.height=3, message=FALSE}
+ggplot(avo_clean, aes((volume))) + geom_histogram()
+```
+
+Considering the extreme right-skew, we need to consider applying transformations. Through rial-and-error, log transformations turn out to be the best. 
+
+The two peaks are the two demand curves for **organic** and **conventional** avocado products. 
+```{r warning = FALSE, fig.width=6,fig.height=3, message=FALSE}
+ggplot(avo_clean, aes(log(volume))) + geom_histogram()
+```
+
+Looking at the individual demand historgram for 'conventional', we can see that it fits the normal distribution curve pretty well. 
+```{r fig.width=7,fig.height=4}
+conventional <- avo_clean%>%filter(type=='conventional')
+organic <- avo_clean%>%filter(type=='organic')
+plotNormalHistogram(log(conventional$volume))
+```
+
+To further improve our transformations, we could explore box-cox transformations, but for this project, I stuck to using the log-transform. 
+
+**The demand-price relationship often follows a log-curve.**
+
+Let's check for that. In the following graph, color indicates region.
+
+```{r echo=FALSE, fig.width=7,fig.height=4}
+x_conventional = avocado %>% filter(volume<2000000,type=='conventional')
+
+ggplot(x_conventional, aes(price,(volume),color=region)) + geom_point()+theme(legend.position = 'none')+ labs(title='Demand vs. Price')
+```
+
+As we can see, applying a log transformation to the Demand variable improves the linearity between demand and price. 
+
+```{r echo=FALSE, fig.width=7,fig.height=4}
+ggplot(x_conventional, aes((price), log(volume),color=region)) + geom_point()+theme(legend.position = 'none')+ labs(title='Demand vs. Price (log-transformed)')
+```
+
+## Exploring linear regression fits
+
+The main assumptions of linear regression are that:
+1. residual plots show no pattern when plotted against fitted values, and that 
+2. error terms are homoscedastic (equal variance)
+
+After applying log transformations, let us explore the error plots for **Atlanta, conventional type.**
+
+```{r fig.width=6,fig.height=3}
+
+example_1 <- avo_clean%>%filter(region=='Atlanta', type=='conventional')
+
+#the linear model
+m1 = lm(log(volume) ~ price + trend + month, example_1)
+
+#error plots
+plot(m1)
+```
+
+Our errors appear randomly distributed, so the model seems to work well in this case.
+
+However, we will be building models for different regions, and not all will fit well.
+With box-cox tranformations and fourier terms, we im to capture more information over seasonality and produce better linear fits.
+
+
+Let us explore how the demand varies over time for specific regions. 
+
+## Example of a time series: Northern New England, Orlando
+
+```{r fig.width=6.5,fig.height=3}
+#plotting each individual time series
+for(reg in unique(avocado$region)[31:32]){
+  
+  ts = avocado %>% filter(region == reg)
+  print(ggplot(ts, aes(date, volume, color = type)) + geom_line() + labs(title=eval(reg)))
+  
+}
+```
+
+All regions are showing distinct seasonal patterns, indicating the need to include seasonal terms as regressors. 
+
+Let's move into building models to predict demand.
+
+## Price Elasticity of Demand
+
+Price elasticity of demand can best be understood by the log-log model (price and demand are both transformed into the log variable). Let's take a look.
+
+```{r fig.width=7, fig.height=4}
+#visualising the log-log model
+ggplot(x_conventional, aes(log(volume),log(price), color = region)) + 
+  geom_point() +theme(legend.position = 'none')+ 
+  labs(title='Demand vs. Price (log-log model)')
+```
+
+Let's see which region is showing the least and most price sensitivity in terms of demand:
+
+```{r}
+price_elasticity<-data.frame()
+
+for(t in unique(avo_clean$type)){
+  for(r in unique(avo_clean$region)){
+    
+    series = avo_clean %>% filter(region == r, type == t)
+
+    lmm<-(lm(log(volume) ~ log(price) + trend + month, series))
+    row<-data.frame(region= r, type = t, 
+             elasticity =  coef(summary(lmm))["log(price)","Estimate"])
+     price_elasticity<-rbind(price_elasticity, row)
+#print(coef(summary(lmm))["log(price)","Estimate"])
+
+}}
+
+sorted = price_elasticity%>%group_by(type)%>%
+         dplyr::arrange(elasticity, .by_group=TRUE)
+
+sorted %>%group_by(type) %>%
+slice(c(1, n())) %>%
+ungroup()
+```
+
+Interestingly, the demand for organic avocados is actually increasing with an increase in price!
+
+
+# Building Models
+
+Based on the histogram plots and residual errors, we apply a log transformation to the 'volume' (representing demand). 
+
+We then build the following models to predict the demand: 
+
+1) naive forecast: Baseline metric to compare whether our models are performing better than no models
+2) ARIMA without regressors: we use this model to check whether our predictors ie. price and trend are improving our forecasts. 
+3) ARIMA with price
+4) ARIMA with fourier terms (to model weekly seasonality)
+5) Time series regression (tslm) with fourier terms for seasonality, trend, and price
+6) Seemingly Unrelated regression (SUR): simultaneously solving different equations for different region-and-type combinations. Assumption here is that while they will have separate parameters, they all suffer from the same noise/error elements which are modeled into the equation
+7) Ensemble over best-performing models to check if it improves accuracy. Here we average our forecasts over ARIMA and SUR 
+
+The rmd file contains the whole code. 
+
+```{r include = FALSE, echo=T, results='hide', warning=FALSE}
+#for SUR
+final = data.frame(index = c(1:169))
+to_test = data.frame(index = c(1:169))
+formulas = list()
+
+#removing aggregates
+avo_clean = avocado%>%filter(!region %in% c('Southeast','Midsouth', 'West', 'SouthCentral','NorthEast','WestTexNewMexico', "TotalUS"))
+avo_clean$type = as.factor(avo_clean$type)
+
+#recording model errors, and forecast estimates for each individual time series
+#(stored in compare all)
+rmse_errors = data.frame(errors=c('uni_arima','arima','fourier','tslm','mape_naive'))
+mape_errors = data.frame(errors=c('uni_arima','arima','fourier','tslm','mape_naive'))
+compare_all = data.frame()
+
+for(t in unique(avo_clean$type)){
+  
+  for(r in unique(avo_clean$region)){
+    
+    #--------ARIMA with fourier terms---------------------------------------
+    series = avo_clean %>% filter(region == r, type == t) %>% arrange(date)
+    series$volume= log(series$volume)
+    
+    avo_demand = ts(series$volume,
+                    start=decimal_date(ymd('2015-01-04')),freq=365.25/7)
+    avo_price = ts(series$price, start=decimal_date(ymd('2015-01-04')),freq=365.25/7)
+    
+    train_x = head(avo_price, 135)
+    train_y = head(avo_demand, 135)
+    
+    test_x = tail(avo_price, 34)
+    test_y = exp(tail(avo_demand, 34)) #back to original scale
+    
+    #ARIMA_fourier
+    bestfit <- list(aic=Inf)
+    best_i = 100
+    for(i1 in 1:25) #K< 52/2
+    {
+     fit <- auto.arima(train_y, xreg=cbind(train_x,fourier(train_y, K=i1)), 
+                      seasonal=FALSE,approximation=FALSE, num.cores=8,lambda = 'auto') #fourier terms
+    #as external regressors - dynamic harmonic regression
+     if(fit$aic < bestfit$aic){
+      bestfit <- fit
+      best_i = i1}
+     else break;
+    } 
+    
+
+    forecast_fourier<-forecast(bestfit, h=length(test_y), xreg =
+                             cbind(test_x,fourier(train_y, K=best_i,h = 34)))
+    predicted_fourier = exp(forecast_fourier$mean) #back to original scale
+    mape_fourier = mean(abs(predicted_fourier - test_y)/test_y)*100
+    rmse_fourier = (mean((predicted_fourier - test_y)^2))^0.5
+    
+    #ARIMA no fourier
+    fit_arima<-auto.arima(train_y, xreg=cbind(train_x), 
+                      seasonal=TRUE, approximation=FALSE,num.cores=8,lambda='auto')
+    forecast_arima<-forecast(fit_arima, h=length(test_y), xreg = test_x)
+    predicted_arima = exp(forecast_arima$mean) #back to original scale
+    mape_arima = mean(abs(predicted_arima - test_y)/test_y)*100
+    rmse_arima = (mean((predicted_arima - test_y)^2))^0.5
+    
+    #ARIMA univariate
+    fit_uni_arima<-auto.arima(train_y,  
+                      seasonal=TRUE, approximation=FALSE, num.cores=8)
+    forecast_uni_arima<-forecast(fit_uni_arima, h=length(test_y))
+    predicted_uni_arima = exp(forecast_uni_arima$mean) #back to original scale
+    mape_uni_arima = mean(abs(predicted_uni_arima - test_y)/test_y)*100
+    rmse_uni_arima = (mean((predicted_uni_arima - test_y)^2))^0.5
+    
+    #----------- TSLM------------------------------------------------
+    
+    train = head(series, 135)
+    test = tail(series, nrow(series) - nrow(train))
+    
+    train_ts=ts(train, start=decimal_date(ymd('2015-01-04')),freq=365.25/7)
+    
+    ts_model = NULL
+    bestfit_aic <- Inf
+    best_i = 100
+    for(i1 in 1:25) #K< 52/2
+    {
+    #fitting for different fourier terms
+     ts_m = tslm(volume ~ price+trend+fourier(volume, K=i1), data = train_ts)
+    
+     if(AIC(ts_m) < bestfit_aic){
+      ts_model<-ts_m
+      bestfit_aic = AIC(ts_model)
+      best_i = i1}
+     else break;
+    } 
+    #to predict and calc test errors
+    newdata = data.frame(
+      price = test$price,
+      trend = test$trend,
+      volume = test$volume
+    )
+    newdata_ts = ts(newdata,start=decimal_date(ymd('2017-08-06')),freq=365.25/7)
+    
+    fourier_terms = data.frame(fourier(ts(train$volume,
+                      start=decimal_date(ymd('2015-01-04')),freq=365.25/7),
+                      K=best_i, h = 34))
+    newdata = cbind(newdata, fourier_terms)
+    
+    predicted_tslm = exp(forecast(ts_model,newdata)$mean)
+    mape_tslm = mean(abs(predicted_tslm - test_y)/test_y)*100
+    rmse_tslm = (mean((predicted_tslm - test_y)^2))^0.5
+    
+    #---------------------naive-----------------------------------
+    forecast_naive<-naive(train_y, length(test_y))
+    predicted_naive<-exp(forecast_naive$mean)
+    rmse_naive<-(mean((predicted_naive - test_y)^2))^0.5
+    mape_naive = mean(abs(predicted_naive - test_y)/test_y)*100
+    
+    
+    #------------saving predicted values in frame-------------------
+    compare = data.frame(region = rep(r,length(test_y)), type =
+                           rep(t,length(test_y)),
+                       week =seq.Date(from = as.Date("2017-08-06"),by = 7, 
+                                      length.out = length(test_y)))
+    compare<-cbind(compare,data.frame(fourier=as.numeric(predicted_fourier),
+                                      tslm = as.numeric(predicted_tslm),
+                                      naive = as.numeric(predicted_naive),
+                                      arima = as.numeric(predicted_arima),
+                                      uni_arima = as.numeric(predicted_uni_arima),
+                                      actual = as.numeric(test_y)))
+                  
+    compare_all<-rbind(compare_all,compare)
+    
+    #creating separate variables for each 
+    forecast_values_essential<-cbind(fourier=predicted_fourier,
+                                     naive = predicted_naive,
+                                     tslm = predicted_tslm,
+                                     arima = predicted_arima,
+                                     uni_arima = predicted_uni_arima,
+                                     actual_loss=tail(avo_demand, 45))
+    
+    assign(paste('fc_',r,'_',t,sep=""),forecast_values_essential)
+    
+    #-------------------------error---------------------------------
+    #adding error metrics of all models for each merch_div
+    rmse_errors<-cbind(rmse_errors, assign(paste(r,'_',t,sep=''),
+                       c(rmse_uni_arima, rmse_arima,rmse_fourier,rmse_tslm,rmse_naive)))
+    colnames(rmse_errors)[ncol(rmse_errors)]<-paste(r,'_',t,sep='')
+  
+    #same for mape
+    mape_errors<-cbind(mape_errors, assign(paste(r,'_',t,sep=''),
+                      c(mape_uni_arima,mape_arima,mape_fourier,mape_tslm,mape_naive)))
+    colnames(mape_errors)[ncol(mape_errors)]<-paste(r,'_',t,sep='')
+    
+    #----------------------------lm formulae for SUR-----------------------
+    
+    series = avo_clean %>% filter(region == r, type == t) %>% arrange(date)
+  
+    assign(paste(r,'_',t,'_demand',sep=""),series$volume)
+    assign(paste(r,'_',t,'_price',sep=""),series$price)
+    assign(paste(r,'_',t,'_trend',sep=""),series$trend)
+    
+    assign(paste(r,'_',t,'_month',sep=""),series$month)
+    
+    #to train the model
+    #price
+    final<-cbind(final, dummy =
+                        eval(as.name(paste(r,'_',t,'_price',sep=""))))
+    colnames(final)[ncol(final)]<-paste(r,'_',t,'_price',sep="")
+    #demand
+    final<-cbind(final, dummy =
+                        eval(as.name(paste(r,'_',t,'_demand',sep=""))))
+    colnames(final)[ncol(final)]<-paste(r,'_',t,'_demand',sep="")
+    #trend
+    final<-cbind(final, dummy =
+                        eval(as.name(paste(r,'_',t,'_trend',sep=""))))
+    colnames(final)[ncol(final)]<-paste(r,'_',t,'_trend',sep="")
+    #month
+    final<-cbind(final, dummy =
+                        eval(as.name(paste(r,'_',t,'_month',sep=""))))
+    colnames(final)[ncol(final)]<-paste(r,'_',t,'_month',sep="")
+    
+    
+    #to test the model (making a dataframe of only the demand)
+    to_test<-cbind(to_test, dummy =
+                        eval(as.name(paste(r,'_',t,'_demand',sep=""))))
+    colnames(to_test)[ncol(to_test)]<-paste(r,'_',t,sep="")
+    
+    f1 = paste('log(',paste(r,'_',t,'_demand',sep=""),')', sep = "") 
+    #f1 = paste(r,'_',t,'_demand',sep="")
+    f2 =  paste(r,'_',t,'_price',sep="")
+    f3 = paste(r,'_',t,'_trend',sep="")
+    
+    f4 = paste(r,'_',t,'_month',sep="")
+    f <- as.formula(paste(f1,"~",f2,"+",f3,"+",f4,sep=""))
+    
+    formulas = append(formulas, f)
+    names(formulas)[length(formulas)]<-paste(r,'-',t,sep="")
+                  
+
+  }
+}
+
+final = final %>% dplyr::select(-index)
+
+train = head(final, 135)
+test_predictors = tail(final, nrow(final)-nrow(train))
+
+to_test = to_test %>% dplyr::select(-c(index))
+test_easy = tail(to_test, nrow(final)-nrow(train))
+
+#compare_all dataframe has demand forecasts
+```
+
+## SUR model
+
+```{r echo=T, results='hide', warning=FALSE}
+SUR_model <- systemfit(formulas, method = "SUR",data=train)
+
+SUR_pre_transform = predict(SUR_model, test_predictors)
+SUR_predicted = data.frame(exp(SUR_pre_transform)) #back to original scale
+
+SUR_clean = data.frame(exp(SUR_pre_transform),week =seq.Date(from = as.Date("2017-08-06"),
+                                      by = 7, 
+                                      length.out = 34))
+                      
+SUR_long = gather(SUR_clean,key='region_type', value='SUR',-week)
+SUR_long = separate(data = SUR_long, col = region_type, into = c("region", "type"))
+compare_final = merge(SUR_long, compare_all, 
+                      by.x = c('region','type','week'), by.y=c('region','type','week'))
+
+```
+
+## Ensemble model: mean over ARIMA and SUR forecasts
+
+```{r }
+#ensemble
+compare_final$ensemble <- rowMeans(subset(compare_final, 
+                                        select = c(SUR, arima)), na.rm = TRUE)
+
+#rmse ensemble
+ensemble_rmse = compare_final %>% group_by(type,region)%>%
+  summarise(ensemble = mean((ensemble - actual)^2)^0.5) %>% 
+  unite(region_type, region, type, sep='_')
+n<-ensemble_rmse$region_type
+ensemble_rmse = data.frame(t(ensemble_rmse[,-1]))
+colnames(ensemble_rmse)=n
+ensemble_rmse = tibble::rownames_to_column(ensemble_rmse, 'errors')
+rmse_errors = rbind(rmse_errors, ensemble_rmse)
+
+#mape ensemble
+ensemble_mape = compare_final %>% group_by(type,region)%>%
+  summarise(ensemble = mean(abs(ensemble - actual)/actual)*100) %>% 
+  unite(region_type, region, type, sep='_')
+n<-ensemble_mape$region_type
+ensemble_mape = data.frame(t(ensemble_mape[,-1]))
+colnames(ensemble_mape)=n
+ensemble_mape = tibble::rownames_to_column(ensemble_mape, 'errors')
+mape_errors = rbind(mape_errors, ensemble_mape)
+#, mape = )
+
+
+compare_long = gather(compare_final, key='model',
+                      value = 'predicted', - c(region,type,week)) 
+```
+
+
+# Testing our models
+
+Let us look at how our models are performing. 
+
+```{r echo=FALSE}
+
+SUR_rmse_errors = list(errors='SUR')
+SUR_mape_errors = list(errors='SUR')
+for(i in c(1:length(SUR_predicted))){
+cols <- (intersect(names(SUR_predicted), names(test_easy)))
+
+rmse = (mean((SUR_predicted[,i] - test_easy[,i])^2))^0.5
+SUR_rmse_errors = append(SUR_rmse_errors, rmse)
+names(SUR_rmse_errors)[length(SUR_rmse_errors)]<-names(test_easy)[i]
+SUR_rmse_errors=data.frame(SUR_rmse_errors)
+
+mape = mean(abs(SUR_predicted[,i] - test_easy[,i])/test_easy[,i])*100
+SUR_mape_errors = append(SUR_mape_errors, mape)
+names(SUR_mape_errors)[length(SUR_mape_errors)]<-names(test_easy)[i]
+SUR_mape_errors=data.frame(SUR_mape_errors)
+}
+
+rmse_errors = rbind(rmse_errors, SUR_rmse_errors)
+mape_errors = rbind(mape_errors, SUR_mape_errors)
+#mape_errors
+```
+
+# Boxplot of MAPE over different regions and types
+
+```{r echo=FALSE, fig.width=8, fig.height=5}
+errors_reshape<-gather(mape_errors,key='region_type', value='error_value', -errors)
+
+#plotting the boxplot
+errors_meds <- ddply(errors_reshape, .(errors), summarise, med = median(error_value))
+
+h1<-ggplot(errors_reshape, aes(x=errors, y = error_value,fill=errors)) + 
+           geom_boxplot(outlier.fill='green',outlier.color = 'grey') +
+       geom_text(data = errors_meds, aes(x = errors, y = med, label = round(med,1)), 
+       size = 3.5, vjust = -13,color='steelblue') +
+       labs(x='model',y=NULL, title = 'Boxplot of MAPE for different models (showing medians)') + theme(legend.title = element_blank(),plot.background=element_rect(fill="transparent"))+scale_fill_viridis(discrete = TRUE,option = "D") 
+
+h1
+```
+
+
+Through our boxplots, we can see that an ensemble model is performing the best overall.
+
+Thus, we stick with the *ensmble*.
+
+# Example Forecasts
+
+1. Sacramento, conventional
+
+```{r echo = FALSE, fig.width=7, fig.height=3.5}
+x=compare_long%>%filter(region=='Sacramento',type=='conventional',
+                      model %in% c('SUR','ensemble','arima','actual'))
+ggplot(x, aes(week, predicted,color=model))+geom_line() + 
+  theme(legend.title = element_blank(),
+        plot.background=element_rect(fill="transparent"))+
+  scale_fill_viridis(discrete = TRUE,option = "D")
+```
+
+2. Boston, conventional
+
+```{r echo = FALSE, fig.width=7, fig.height=3.5}
+x=compare_long%>%filter(region=='Boston',type=='conventional',model %in% c('SUR','ensemble','arima','actual'))
+ggplot(x, aes(week, predicted,color=model))+geom_line() + theme(legend.title = element_blank(),plot.background=element_rect(fill="transparent"))+scale_fill_viridis(discrete = TRUE,option = "D")
+```
+
+3. Atlanta, organic (doing not so well)
+
+```{r echo = FALSE, fig.width=7, fig.height=3.5}
+x=compare_long%>%filter(region=='Atlanta',type=='organic',model %in% c('SUR','ensemble','arima','actual'))
+ggplot(x, aes(week, predicted,color=model))+geom_line() + theme(legend.title = element_blank(),plot.background=element_rect(fill="transparent"))+scale_fill_viridis(discrete = TRUE,option = "D")
+```
+
+
+# Next steps
+
+To improve our demand forecasts, we could try the following steps:
+
+1) Facebook's Prophet package, which is based on Bayesian interpretations.
+
+2) Customised tranformations: We assumed that a log-linear relationship for all areas and all types, but we need to acount for the fact that different models will share different relationships. 
+
+Box-cox transformation might be worth exploring.
+
+3) Time-series cross-validation: 
+
+Currently we are picking the ensemble model for all combinations of regions and types, but is very much possible that different models are appropriate for different time series. 
+
+If we choose different models based on lowest RMSE/MAPE on test data, then we are overfitting on the test data. However, minimising cross-validated RMSE/MAPE will solve this problem. 
+
+The tsCV() function in R will allow us to calculate errors for different time windows, thus making our estimate of error more robust. 
+
+4) Data on anomalous events in the avocado industry would help in explaining suddent spikes/drops.
+
+5) Because this data is in the realm of 'panel' data (as they call it in the field of econometrics), exploring fixed & random effects model would be beneficial. We already explored SUR and found favourable results compared to simpler models. 
+
+
