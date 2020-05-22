@@ -12,6 +12,8 @@ After preliminary data exploration to explore the relationship between the deman
 
 As we will learn later, the ensemble model performs the best on an aggregate level.
 
+**I also explored the price elasticity of demand for different regions.**
+
 The pdf file in this repository contains my detailed approach to explore this project. 
 
 The rmd file contains the entire code I used for this project. 
